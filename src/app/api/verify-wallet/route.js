@@ -1,5 +1,5 @@
 export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
+export const runtime = "edge";
 
 import { verifyBscWalletByMethod } from "../../../lib/bsc-wallet-verifier";
 

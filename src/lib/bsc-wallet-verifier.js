@@ -27,56 +27,15 @@ function toPositiveInt(value, fallback) {
   return Math.floor(n);
 }
 
-function normalizeProxyUrl(raw) {
-  const text = String(raw || "").trim();
-  if (!text) return "";
-  return /^https?:\/\//i.test(text) ? text : `http://${text}`;
-}
-
-function getProxyUrl() {
-  return normalizeProxyUrl(
-    process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.PROXY_URL || ""
-  );
-}
-
-const proxyUrl = getProxyUrl();
-
-function createProxyAgent(url) {
-  try {
-    const req = eval("require");
-    const HttpsProxyAgent = req("https-proxy-agent");
-    return new HttpsProxyAgent(url);
-  } catch {
-    return null;
-  }
-}
-
-const proxyAgent = proxyUrl ? createProxyAgent(proxyUrl) : null;
-const transportCandidates = [
-  { name: "direct", options: {} },
-  ...(proxyAgent
-    ? [
-        {
-          name: `proxy:${proxyUrl}`,
-          options: { agent: proxyAgent },
-        },
-      ]
-    : []),
-];
-
-let preferredTransportIndex = 0;
-
-function mergeFetchOptions(base, extra, timeoutMs) {
+function mergeFetchOptions(base, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   const merged = {
     ...base,
-    ...extra,
     signal: controller.signal,
     headers: {
       ...(base?.headers || {}),
-      ...(extra?.headers || {}),
     },
   };
 
@@ -156,38 +115,29 @@ function isNoTxResponse(data) {
 }
 
 async function fetchWithFallback(url, init = {}) {
-  const order = [preferredTransportIndex, ...transportCandidates.map((_, i) => i)].filter(
-    (index, pos, arr) => arr.indexOf(index) === pos
-  );
-
   let lastError = null;
-  let lastTransport = "unknown";
   let lastResponse = null;
 
   for (let attempt = 1; attempt <= FETCH_RETRIES; attempt += 1) {
-    for (const index of order) {
-      const transport = transportCandidates[index];
-      if (!transport) continue;
+    let response;
+    const wrapped = mergeFetchOptions(init, HTTP_TIMEOUT_MS);
+    try {
+      response = await fetch(url, wrapped.merged);
+    } catch (error) {
+      lastError = error;
+    } finally {
+      wrapped.clear();
+    }
 
-      let response;
-      const wrapped = mergeFetchOptions(init, transport.options, HTTP_TIMEOUT_MS);
-      try {
-        response = await fetch(url, wrapped.merged);
-      } catch (error) {
-        lastError = error;
-        lastTransport = transport.name;
-      } finally {
-        wrapped.clear();
+    if (!response) {
+      if (attempt < FETCH_RETRIES) {
+        await sleep(RETRY_BACKOFF_MS * attempt);
       }
+      continue;
+    }
 
-      if (!response) continue;
-
-      preferredTransportIndex = index;
-      lastResponse = response;
-
-      if (shouldRetryStatus(response.status) && attempt < FETCH_RETRIES) {
-        continue;
-      }
+    lastResponse = response;
+    if (!shouldRetryStatus(response.status) || attempt >= FETCH_RETRIES) {
       return response;
     }
 
@@ -199,7 +149,7 @@ async function fetchWithFallback(url, init = {}) {
   if (lastResponse) return lastResponse;
 
   const detail = lastError?.message || "fetch failed";
-  throw new Error(`Network error via ${lastTransport}: ${detail}`);
+  throw new Error(`Network error: ${detail}`);
 }
 
 async function fetchTxPageFromEtherscan(address, page, apiKey) {
