@@ -88,46 +88,18 @@ export async function GET(request) {
       );
     }
 
-    const [freeMintCap, totalMintedFree, paidMintCap, totalMintedPaid, totalMinted, maxSupply] = await Promise.all([
+    const [freeMintCap, totalMintedFree] = await Promise.all([
       readUint256(contractAddress, ALPHA_FUNCTION_SELECTORS.freeMintCap),
       readUint256(contractAddress, ALPHA_FUNCTION_SELECTORS.totalMintedFree),
-      readUint256(contractAddress, ALPHA_FUNCTION_SELECTORS.paidMintCap),
-      readUint256(contractAddress, ALPHA_FUNCTION_SELECTORS.totalMintedPaid),
-      readUint256(contractAddress, ALPHA_FUNCTION_SELECTORS.totalMinted),
-      readUint256(contractAddress, ALPHA_FUNCTION_SELECTORS.maxSupply),
     ]);
 
-    let accountData = null;
+    let mintedFreeBy = 0n;
     if (isAddress(normalizedAddress)) {
-      const [claimable, mintedBy, mintedFreeBy, balanceOf] = await Promise.all([
-        readUint256ByAddress(
-          contractAddress,
-          ALPHA_FUNCTION_SELECTORS.claimable,
-          normalizedAddress
-        ),
-        readUint256ByAddress(
-          contractAddress,
-          ALPHA_FUNCTION_SELECTORS.mintedBy,
-          normalizedAddress
-        ),
-        readUint256ByAddress(
-          contractAddress,
-          ALPHA_FUNCTION_SELECTORS.mintedFreeBy,
-          normalizedAddress
-        ),
-        readUint256ByAddress(
-          contractAddress,
-          ALPHA_FUNCTION_SELECTORS.balanceOf,
-          normalizedAddress
-        ),
-      ]);
-      accountData = {
-        address: normalizedAddress,
-        claimable: claimable.toString(),
-        mintedBy: mintedBy.toString(),
-        mintedFreeBy: mintedFreeBy.toString(),
-        balanceOf: balanceOf.toString(),
-      };
+      mintedFreeBy = await readUint256ByAddress(
+        contractAddress,
+        ALPHA_FUNCTION_SELECTORS.mintedFreeBy,
+        normalizedAddress
+      );
     }
 
     return Response.json(
@@ -136,11 +108,7 @@ export async function GET(request) {
         data: {
           freeMintCap: freeMintCap.toString(),
           totalMintedFree: totalMintedFree.toString(),
-          paidMintCap: paidMintCap.toString(),
-          totalMintedPaid: totalMintedPaid.toString(),
-          totalMinted: totalMinted.toString(),
-          maxSupply: maxSupply.toString(),
-          account: accountData,
+          mintedFreeBy: mintedFreeBy.toString(),
         },
       },
       { status: 200 }

@@ -1,7 +1,5 @@
 ﻿'use client';
 
-import { sha256 } from '@noble/hashes/sha256';
-import { bytesToHex } from '@noble/hashes/utils';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   ALPHA_CONTRACT_ADDRESS,
@@ -39,20 +37,6 @@ export default function Home() {
   ];
 
   const uniqueWords = [...new Set(words)];
-
-  const getSha256Hex = async (input) => {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(input);
-    const subtle = globalThis.crypto?.subtle;
-    if (subtle) {
-      const hashBuffer = await subtle.digest('SHA-256', data);
-      return Array.from(new Uint8Array(hashBuffer))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-    }
-    // Fallback for non-HTTPS contexts or environments without Web Crypto.
-    return bytesToHex(sha256(data));
-  };
 
   const generateRandomPositions = () => {
     const positions = [];
@@ -748,13 +732,8 @@ export default function Home() {
       if (data?.success && data?.data) {
         setFreeMintCapWei(BigInt(data.data.freeMintCap || '0'));
         setTotalMintedFreeWei(BigInt(data.data.totalMintedFree || '0'));
-        const account = data.data.account;
-        if (account) {
-          const mintedFreeBy = BigInt(account.mintedFreeBy || '0');
-          setYourMintWei(mintedFreeBy);
-        } else {
-          setYourMintWei(0n);
-        }
+        const mintedFreeBy = BigInt(data.data.mintedFreeBy || '0');
+        setYourMintWei(mintedFreeBy);
         setMintStatsReady(true);
       }
     } catch {
@@ -874,44 +853,58 @@ export default function Home() {
 
   const validateWallet = async (walletAddress) => {
     const queryResponse = await fetch(
-      `/api/verify-wallet?address=${encodeURIComponent(walletAddress.trim())}`,
+      `/checkIn?address=${encodeURIComponent(walletAddress.trim())}`,
       {
         method: 'GET',
         headers: {
-          Accept: 'application/json',
+          Accept: 'text/plain,application/json,*/*',
         },
         cache: 'no-store',
       }
     );
 
-    let messageObj;
+    let rawText = '';
     try {
-      messageObj = await queryResponse.json();
+      rawText = (await queryResponse.text()).trim();
     } catch {
       return { success: false, message: 'PLEASE TRY AGAIN LATER' };
     }
 
-    const result = Boolean(messageObj?.success);
-
-    if (result) {
-      const timestamp = Date.now();
-      const random = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-      const addressHash = walletAddress.substring(0, 8) + walletAddress.substring(walletAddress.length - 8);
-      const uniqueToken = `${timestamp}-${random}-${addressHash}`;
-
-      const encoder = new TextEncoder();
-      const secret = 'alpha-project-secret-key';
-      const signatureHex = await getSha256Hex(uniqueToken + secret);
-      const finalToken = `${uniqueToken}-${signatureHex.substring(0, 16)}`;
-
-      return {
-        success: true,
-        token: finalToken,
-        expiresAt: timestamp + 3000,
-      };
+    if (!queryResponse.ok) {
+      return { success: false, message: rawText || 'PLEASE TRY AGAIN LATER' };
     }
 
-    return { success: false, message: messageObj?.message || 'YOUR ADDRESS IS NOT ELIGIBLE' };
+    let passed = false;
+    if (rawText === 'true') {
+      passed = true;
+    } else if (rawText === 'false') {
+      passed = false;
+    } else {
+      try {
+        const data = JSON.parse(rawText);
+        if (typeof data === 'boolean') {
+          passed = data;
+        } else if (typeof data?.result === 'boolean') {
+          passed = data.result;
+        } else if (typeof data?.success === 'boolean') {
+          passed = data.success;
+        } else {
+          return { success: false, message: 'INVALID CHECK RESPONSE' };
+        }
+      } catch {
+        return { success: false, message: rawText || 'INVALID CHECK RESPONSE' };
+      }
+    }
+
+    if (!passed) {
+      return { success: false, message: 'YOUR ADDRESS IS NOT ELIGIBLE' };
+    }
+
+    return {
+      success: true,
+      token: `CHECKIN_TRUE-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+      expiresAt: Date.now() + 3000,
+    };
   }
 
   const handleSubmit = async (e) => {
@@ -974,35 +967,6 @@ export default function Home() {
 
       if (usedTokensRef.current.has(token.token)) {
         setValidationMessage('TOKEN ALREADY USED, PLEASE RE-VALIDATE');
-        setValidationToken(null);
-        setSubmitting(false);
-        return;
-      }
-
-      const tokenParts = token.token.split('-');
-      if (tokenParts.length < 4) {
-        setValidationMessage('INVALID TOKEN FORMAT');
-        setValidationToken(null);
-        setSubmitting(false);
-        return;
-      }
-
-      const uniqueToken = `${tokenParts[0]}-${tokenParts[1]}-${tokenParts[2]}`;
-      const secret = 'alpha-project-secret-key';
-      const signatureHex = await getSha256Hex(uniqueToken + secret);
-      const expectedSignature = signatureHex.substring(0, 16);
-
-      if (tokenParts[3] !== expectedSignature) {
-        setValidationMessage('INVALID TOKEN SIGNATURE');
-        setValidationToken(null);
-        setSubmitting(false);
-        return;
-      }
-
-      const addressHash = tokenParts[2];
-      const expectedHash = walletAddress.substring(0, 8) + walletAddress.substring(walletAddress.length - 8);
-      if (addressHash !== expectedHash) {
-        setValidationMessage('TOKEN WALLET ADDRESS MISMATCH');
         setValidationToken(null);
         setSubmitting(false);
         return;

@@ -1,24 +1,33 @@
-import {
-  BSC_CHAIN_ID as DEFAULT_BSC_CHAIN_ID,
-  BSCSCAN_TX_LIST_URL as DEFAULT_BSCSCAN_TX_LIST_URL,
-  BSC_RPC_URLS as DEFAULT_BSC_RPC_URLS,
-} from "../config/bsc-network";
+import { createHmac } from "node:crypto";
 
 const BNB_WEI = 1000000000000000000n;
 const METHOD_ID_DEFAULT = "0xc8aa65c1";
+const BSC_CHAIN_ID = String(process.env.VERIFY_CHAIN_ID || "56").trim();
 
-const ETHERSCAN_V2_API = process.env.ETHERSCAN_V2_API || "https://api.etherscan.io/v2/api";
-const BSC_CHAIN_ID = String(DEFAULT_BSC_CHAIN_ID);
-const PAGE_SIZE = 1000;
+const OKX_API_BASE_URL = String(
+  process.env.OKX_API_BASE_URL || process.env.OKLINK_API_BASE_URL || "https://web3.okx.com"
+)
+  .trim()
+  .replace(/\/+$/, "");
+
+const OKX_TXS_PATH = "/api/v6/dex/post-transaction/transactions-by-address";
+const OKX_TX_DETAIL_PATH = "/api/v6/dex/post-transaction/transaction-detail-by-txhash";
+
+const OKX_API_KEY = String(
+  process.env.OKX_API_KEY || process.env.OKLINK_API_KEY || process.env.VERIFY_API_KEY || ""
+).trim();
+const OKX_SECRET_KEY = String(
+  process.env.OKX_SECRET_KEY || process.env.OKLINK_SECRET_KEY || process.env.VERIFY_API_SECRET || ""
+).trim();
+const OKX_PASSPHRASE = String(
+  process.env.OKX_PASSPHRASE || process.env.OKLINK_PASSPHRASE || process.env.VERIFY_API_PASSPHRASE || ""
+).trim();
+const OKX_PROJECT_ID = String(process.env.OKX_PROJECT_ID || process.env.OK_ACCESS_PROJECT || "").trim();
+
 const MAX_PAGES = toPositiveInt(process.env.MAX_PAGES, 200);
-const MAX_BSCSCAN_PAGES = toPositiveInt(process.env.MAX_BSCSCAN_PAGES, 50);
-const BSCSCAN_TX_LIST_URL = DEFAULT_BSCSCAN_TX_LIST_URL;
-const BSCSCAN_TX_FILTER = String(process.env.BSCSCAN_TX_FILTER || "2").trim();
-const USE_ETHERSCAN_FIRST = process.env.USE_ETHERSCAN_FIRST === "1";
+const PAGE_SIZE = Math.min(100, toPositiveInt(process.env.OKX_PAGE_SIZE, 20));
 const FETCH_RETRIES = toPositiveInt(process.env.FETCH_RETRIES, 3);
 const RETRY_BACKOFF_MS = toPositiveInt(process.env.RETRY_BACKOFF_MS, 350);
-const RPC_BATCH_SIZE = toPositiveInt(process.env.RPC_BATCH_SIZE, 25);
-const BSC_RPC_URLS = DEFAULT_BSC_RPC_URLS;
 const HTTP_TIMEOUT_MS = toPositiveInt(process.env.HTTP_TIMEOUT_MS, 15000);
 
 function toPositiveInt(value, fallback) {
@@ -31,62 +40,18 @@ function mergeFetchOptions(base, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-  const merged = {
-    ...base,
-    signal: controller.signal,
-    headers: {
-      ...(base?.headers || {}),
-    },
-  };
-
   return {
-    merged,
+    merged: {
+      ...base,
+      signal: controller.signal,
+      headers: {
+        ...(base?.headers || {}),
+      },
+    },
     clear() {
       clearTimeout(timeout);
     },
   };
-}
-
-function isValidAddress(address) {
-  return /^0x[a-fA-F0-9]{40}$/.test(address);
-}
-
-function normalizeMethodId(methodId) {
-  const value = String(methodId || "").toLowerCase();
-  if (!/^0x[a-f0-9]{8}$/.test(value)) {
-    throw new Error(`Invalid methodId: ${methodId}`);
-  }
-  return value;
-}
-
-function isMethodSelector(text) {
-  return /^0x[a-f0-9]{8}$/i.test(String(text || "").trim());
-}
-
-function parseBnbToWei(value, strict = false) {
-  const text = String(value || "").replace(/,/g, "").trim();
-  if (!text || text.startsWith("<")) return 0n;
-  if (!/^\d+(\.\d+)?$/.test(text)) {
-    if (strict) throw new Error(`Invalid BNB amount: ${value}`);
-    return 0n;
-  }
-
-  const [intPart, fracPartRaw = ""] = text.split(".");
-  const fracPart = (fracPartRaw + "0".repeat(18)).slice(0, 18);
-  return BigInt(intPart) * BNB_WEI + BigInt(fracPart || "0");
-}
-
-function toBigIntSafe(value) {
-  try {
-    return BigInt(value);
-  } catch {
-    return 0n;
-  }
-}
-
-function isSuccessReceipt(receipt) {
-  const status = String(receipt?.status || "").toLowerCase();
-  return status === "0x1" || status === "1";
 }
 
 function shouldRetryStatus(status) {
@@ -97,24 +62,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function chunkArray(arr, size) {
-  const chunks = [];
-  for (let i = 0; i < arr.length; i += size) {
-    chunks.push(arr.slice(i, i + size));
-  }
-  return chunks;
-}
-
-function isNoTxResponse(data) {
-  const message = String(data?.message || "");
-  const result = String(data?.result || "");
-  return (
-    message.toLowerCase().includes("no transactions found") ||
-    result.toLowerCase().includes("no transactions found")
-  );
-}
-
-async function fetchWithFallback(url, init = {}) {
+async function fetchWithRetry(url, init = {}) {
   let lastError = null;
   let lastResponse = null;
 
@@ -130,9 +78,7 @@ async function fetchWithFallback(url, init = {}) {
     }
 
     if (!response) {
-      if (attempt < FETCH_RETRIES) {
-        await sleep(RETRY_BACKOFF_MS * attempt);
-      }
+      if (attempt < FETCH_RETRIES) await sleep(RETRY_BACKOFF_MS * attempt);
       continue;
     }
 
@@ -141,263 +87,235 @@ async function fetchWithFallback(url, init = {}) {
       return response;
     }
 
-    if (attempt < FETCH_RETRIES) {
-      await sleep(RETRY_BACKOFF_MS * attempt);
-    }
+    if (attempt < FETCH_RETRIES) await sleep(RETRY_BACKOFF_MS * attempt);
   }
 
   if (lastResponse) return lastResponse;
-
-  const detail = lastError?.message || "fetch failed";
-  throw new Error(`Network error: ${detail}`);
+  if (lastError) throw lastError;
+  throw new Error("fetch failed");
 }
 
-async function fetchTxPageFromEtherscan(address, page, apiKey) {
-  const params = new URLSearchParams({
-    chainid: BSC_CHAIN_ID,
-    module: "account",
-    action: "txlist",
-    address,
-    page: String(page),
-    offset: String(PAGE_SIZE),
-    sort: "asc",
-  });
+function isValidAddress(address) {
+  return /^0x[a-fA-F0-9]{40}$/.test(address);
+}
 
-  if (apiKey) params.set("apikey", apiKey);
+function normalizeMethodId(methodId) {
+  const value = String(methodId || "").toLowerCase();
+  if (!/^0x[a-f0-9]{8}$/.test(value)) {
+    throw new Error(`Invalid methodId: ${methodId}`);
+  }
+  return value;
+}
 
-  const response = await fetchWithFallback(`${ETHERSCAN_V2_API}?${params.toString()}`);
+function parseBnbToWei(value, strict = false) {
+  const text = String(value || "").replace(/,/g, "").trim();
+  if (!text || text.startsWith("<")) return 0n;
+  if (!/^\d+(\.\d+)?$/.test(text)) {
+    if (strict) throw new Error(`Invalid BNB amount: ${value}`);
+    return 0n;
+  }
+
+  const [intPart, fracPartRaw = ""] = text.split(".");
+  const fracPart = (fracPartRaw + "0".repeat(18)).slice(0, 18);
+  return BigInt(intPart) * BNB_WEI + BigInt(fracPart || "0");
+}
+
+function isSuccessStatus(value) {
+  const text = String(value || "").trim().toLowerCase();
+  return text === "success" || text === "2" || text === "1";
+}
+
+function toLower(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function makeSignedHeaders(method, requestPathWithQuery, body, auth) {
+  const timestamp = new Date().toISOString();
+  const methodUpper = String(method || "GET").toUpperCase();
+  const bodyText = body ? String(body) : "";
+  const prehash = `${timestamp}${methodUpper}${requestPathWithQuery}${bodyText}`;
+  const sign = createHmac("sha256", auth.secretKey).update(prehash).digest("base64");
+
+  const headers = {
+    "Content-Type": "application/json",
+    "OK-ACCESS-KEY": auth.apiKey,
+    "OK-ACCESS-SIGN": sign,
+    "OK-ACCESS-PASSPHRASE": auth.passphrase,
+    "OK-ACCESS-TIMESTAMP": timestamp,
+  };
+
+  if (auth.projectId) {
+    headers["OK-ACCESS-PROJECT"] = auth.projectId;
+  }
+
+  return headers;
+}
+
+async function fetchTransactionsByAddress(address, chainId, cursor, auth) {
+  const params = new URLSearchParams();
+  params.set("address", address);
+  params.set("addresses", address);
+  params.set("chains", String(chainId));
+  params.set("limit", String(PAGE_SIZE));
+  if (cursor) params.set("cursor", cursor);
+
+  const requestPathWithQuery = `${OKX_TXS_PATH}?${params.toString()}`;
+  const url = `${OKX_API_BASE_URL}${requestPathWithQuery}`;
+
+  const headers = makeSignedHeaders("GET", requestPathWithQuery, "", auth);
+  const response = await fetchWithRetry(url, { headers });
+
   if (!response.ok) {
-    throw new Error(`Etherscan HTTP ${response.status}`);
+    throw new Error(`OKX HTTP ${response.status}`);
   }
 
-  const data = await response.json();
-  if (data.status === "1" && Array.isArray(data.result)) {
-    return data.result;
-  }
-  if (data.status === "0") {
-    if (isNoTxResponse(data)) return [];
-    throw new Error(`Etherscan API error: ${data.result || data.message || "unknown error"}`);
+  const payload = await response.json();
+  if (String(payload?.code || "") !== "0") {
+    throw new Error(`OKX API error: ${payload?.msg || payload?.message || "unknown error"}`);
   }
 
-  throw new Error(`Unexpected API response: ${JSON.stringify(data)}`);
+  const root = Array.isArray(payload?.data) ? payload.data[0] : null;
+  const txs =
+    (Array.isArray(root?.transactionList) && root.transactionList) ||
+    (Array.isArray(root?.transactions) && root.transactions) ||
+    [];
+  const nextCursor = String(root?.cursor || "").trim();
+
+  return {
+    txs,
+    nextCursor,
+  };
 }
 
-async function hasCalledMethodViaEtherscan(address, methodId, minBnbWei, apiKey) {
+async function fetchTransactionDetail(txHash, chainIndex, itype, auth) {
+  const params = new URLSearchParams();
+  params.set("txHash", txHash);
+  params.set("chainIndex", String(chainIndex));
+  if (itype !== undefined && itype !== null && String(itype).trim() !== "") {
+    params.set("itype", String(itype).trim());
+  }
+
+  const requestPathWithQuery = `${OKX_TX_DETAIL_PATH}?${params.toString()}`;
+  const url = `${OKX_API_BASE_URL}${requestPathWithQuery}`;
+
+  const headers = makeSignedHeaders("GET", requestPathWithQuery, "", auth);
+  const response = await fetchWithRetry(url, { headers });
+
+  if (!response.ok) {
+    throw new Error(`OKX HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  if (String(payload?.code || "") !== "0") {
+    throw new Error(`OKX API error: ${payload?.msg || payload?.message || "unknown error"}`);
+  }
+
+  const detail = Array.isArray(payload?.data) ? payload.data[0] : null;
+  return detail || null;
+}
+
+function summaryFromMatchesTarget(tx, target) {
+  const fromList = Array.isArray(tx?.from) ? tx.from : [];
+  if (fromList.length === 0) return true;
+  return fromList.some((item) => toLower(item?.address) === target);
+}
+
+function detailFromMatchesTarget(detail, target) {
+  const fromDetails = Array.isArray(detail?.fromDetails) ? detail.fromDetails : [];
+  if (fromDetails.length === 0) return true;
+  return fromDetails.some((item) => toLower(item?.address) === target);
+}
+
+function maxAmountWeiFromDetail(detail, summaryTx, target) {
+  let maxWei = 0n;
+
+  const pushAmount = (value) => {
+    const wei = parseBnbToWei(value, false);
+    if (wei > maxWei) maxWei = wei;
+  };
+
+  pushAmount(detail?.amount);
+  pushAmount(summaryTx?.amount);
+
+  const fromDetails = Array.isArray(detail?.fromDetails) ? detail.fromDetails : [];
+  for (const item of fromDetails) {
+    if (toLower(item?.address) === target) {
+      pushAmount(item?.amount);
+    }
+  }
+
+  const fromSummary = Array.isArray(summaryTx?.from) ? summaryTx.from : [];
+  for (const item of fromSummary) {
+    if (toLower(item?.address) === target) {
+      pushAmount(item?.amount);
+    }
+  }
+
+  return maxWei;
+}
+
+async function hasCalledMethodViaOkxTxHistory(address, chainId, methodId, minBnbWei, auth) {
+  const target = toLower(address);
+  let cursor = "";
+  let previousCursor = "";
+
   for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const txs = await fetchTxPageFromEtherscan(address, page, apiKey);
-    if (txs.length === 0) return false;
+    const pageData = await fetchTransactionsByAddress(address, chainId, cursor, auth);
+    const txs = pageData.txs;
+
+    if (!Array.isArray(txs) || txs.length === 0) {
+      return false;
+    }
 
     for (const tx of txs) {
-      const input = String(tx.input || "").toLowerCase();
-      const valueWei = toBigIntSafe(tx.value);
-      const isOk =
-        tx.isError === "0" &&
-        (tx.txreceipt_status === undefined || tx.txreceipt_status === "" || tx.txreceipt_status === "1");
-      if (isOk && input.startsWith(methodId) && valueWei >= minBnbWei) {
-        return true;
-      }
-    }
-    if (txs.length < PAGE_SIZE) return false;
-  }
-  return false;
-}
+      const txHash = String(tx?.txHash || tx?.txhash || "").trim();
+      if (!txHash) continue;
 
-function extractBscScanRows(html) {
-  const tbody = html.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i)?.[1] || "";
-  const source = tbody || html;
-  const rawRows = [...source.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)].map((m) => m[1]);
-  const rows = [];
+      if (!isSuccessStatus(tx?.txStatus)) continue;
+      if (!summaryFromMatchesTarget(tx, target)) continue;
 
-  for (const rowHtml of rawRows) {
-    const hash = rowHtml.match(/\/tx\/(0x[a-fA-F0-9]{64})/)?.[1];
-    if (!hash) continue;
-
-    const methodHint =
-      rowHtml.match(/class="td_functionNameOri"[^>]*>[\s\S]*?data-title="([^"]+)"/i)?.[1] ||
-      rowHtml.match(/class="td_functionNameOri"[^>]*>[\s\S]*?title="([^"]+)"/i)?.[1] ||
-      "";
-
-    const valueHint =
-      rowHtml.match(/class="td_showAmount"[^>]*data-bs-title="([0-9.,<]+)\s+BNB\b/i)?.[1] || "0";
-
-    const direction = (rowHtml.match(/>\s*(OUT|IN)\s*</i)?.[1] || "").toUpperCase();
-    const hasError = /data-bs-title="Error in Main Txn/i.test(rowHtml);
-
-    rows.push({
-      hash,
-      methodHint: methodHint.trim(),
-      valueWei: parseBnbToWei(valueHint, false),
-      direction,
-      hasError,
-    });
-  }
-
-  return rows;
-}
-
-async function fetchBscScanRows(address, page) {
-  const url = new URL(BSCSCAN_TX_LIST_URL);
-  url.searchParams.set("a", address);
-  url.searchParams.set("p", String(page));
-  if (BSCSCAN_TX_FILTER) url.searchParams.set("f", BSCSCAN_TX_FILTER);
-
-  const response = await fetchWithFallback(url.toString(), {
-    headers: {
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "user-agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`BscScan HTTP ${response.status}`);
-  }
-
-  const html = await response.text();
-  if (/attention required|just a moment|cf-browser-verification|captcha/i.test(html)) {
-    throw new Error("BscScan anti-bot page returned");
-  }
-  return extractBscScanRows(html);
-}
-
-async function rpcBatchCallSingle(method, paramsList) {
-  if (!Array.isArray(paramsList) || paramsList.length === 0) return [];
-
-  let lastError = null;
-
-  for (const rpcUrl of BSC_RPC_URLS) {
-    try {
-      const payload = paramsList.map((params, index) => ({
-        jsonrpc: "2.0",
-        id: index + 1,
-        method,
-        params,
-      }));
-
-      const response = await fetchWithFallback(rpcUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) throw new Error(`RPC HTTP ${response.status} at ${rpcUrl}`);
-
-      const data = await response.json();
-      if (!Array.isArray(data)) throw new Error(`RPC ${rpcUrl}: invalid batch response`);
-
-      const byId = new Map(data.map((item) => [item.id, item]));
-      const results = [];
-
-      for (let i = 0; i < paramsList.length; i += 1) {
-        const entry = byId.get(i + 1);
-        if (!entry) {
-          results.push(null);
-          continue;
-        }
-        if (entry.error) {
-          throw new Error(`RPC ${rpcUrl}: ${entry.error.message || JSON.stringify(entry.error)}`);
-        }
-        results.push(entry.result ?? null);
-      }
-
-      return results;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw new Error(`RPC request failed: ${lastError?.message || "unknown error"}`);
-}
-
-async function rpcBatchCall(method, paramsList) {
-  if (!Array.isArray(paramsList) || paramsList.length === 0) return [];
-
-  const chunks = chunkArray(paramsList, RPC_BATCH_SIZE);
-  const out = [];
-  for (const chunk of chunks) {
-    const part = await rpcBatchCallSingle(method, chunk);
-    out.push(...part);
-  }
-  return out;
-}
-
-async function hasCalledMethodViaBscScanRpc(address, methodId, minBnbWei) {
-  const target = address.toLowerCase();
-
-  for (let page = 1; page <= MAX_BSCSCAN_PAGES; page += 1) {
-    const rows = await fetchBscScanRows(address, page);
-    if (rows.length === 0) return false;
-
-    const candidateHashes = [];
-
-    for (const row of rows) {
-      if (row.hasError) continue;
-      if (row.direction && row.direction !== "OUT") continue;
-      if (row.valueWei < minBnbWei) continue;
-
-      const hint = row.methodHint.toLowerCase();
-      if (isMethodSelector(hint)) {
-        if (hint === methodId) candidateHashes.push(row.hash);
+      const summaryMethodId = String(tx?.methodId || "").trim().toLowerCase();
+      if (summaryMethodId && /^0x[a-f0-9]{8}$/.test(summaryMethodId) && summaryMethodId !== methodId) {
         continue;
       }
-      candidateHashes.push(row.hash);
+
+      const detailChainIndex = String(tx?.chainIndex || chainId).trim();
+      const detail = await fetchTransactionDetail(txHash, detailChainIndex, tx?.itype, auth);
+      if (!detail) continue;
+
+      if (!isSuccessStatus(detail?.txStatus)) continue;
+      if (!detailFromMatchesTarget(detail, target)) continue;
+
+      const detailMethodId = String(detail?.methodId || "").trim().toLowerCase();
+      if (detailMethodId !== methodId) continue;
+
+      const maxWei = maxAmountWeiFromDetail(detail, tx, target);
+      if (maxWei < minBnbWei) continue;
+
+      return true;
     }
 
-    if (candidateHashes.length > 0) {
-      const txs = await rpcBatchCall(
-        "eth_getTransactionByHash",
-        candidateHashes.map((hash) => [hash])
-      );
-      const matchedHashes = [];
-
-      for (let i = 0; i < candidateHashes.length; i += 1) {
-        const tx = txs[i];
-        if (!tx) continue;
-        if (String(tx.from || "").toLowerCase() !== target) continue;
-
-        const input = String(tx.input || "").toLowerCase();
-        if (!input.startsWith(methodId)) continue;
-
-        const valueWei = toBigIntSafe(tx.value || "0x0");
-        if (valueWei < minBnbWei) continue;
-
-        matchedHashes.push(candidateHashes[i]);
-      }
-
-      if (matchedHashes.length > 0) {
-        const receipts = await rpcBatchCall(
-          "eth_getTransactionReceipt",
-          matchedHashes.map((hash) => [hash])
-        );
-        if (receipts.some((receipt) => isSuccessReceipt(receipt))) {
-          return true;
-        }
-      }
+    previousCursor = cursor;
+    cursor = String(pageData.nextCursor || "").trim();
+    if (!cursor || cursor === previousCursor) {
+      return false;
     }
-
-    if (rows.length < 50) return false;
   }
 
   return false;
 }
 
-function shouldFallbackFromEtherscan(errorMessage) {
-  const msg = String(errorMessage || "").toLowerCase();
-  return (
-    msg.includes("network error") ||
-    msg.includes("free api access is not supported for this chain") ||
-    msg.includes("max rate limit") ||
-    msg.includes("invalid api key")
-  );
-}
-
-export async function verifyBscWalletByMethod(inputAddress, options = {}) {
+export async function verifyBscWalletViaOkxExplorerOnly(inputAddress, options = {}) {
   const address = String(inputAddress || "").trim();
   const methodId = normalizeMethodId(options.methodId || METHOD_ID_DEFAULT);
   const minBnbInput = options.minBnb || process.env.MIN_BNB || "1";
   const minBnbWei = parseBnbToWei(minBnbInput, true);
-  const apiKey = process.env.ETHERSCAN_API_KEY || process.env.BSCSCAN_API_KEY || "";
+  const chainId = String(options.chainId || BSC_CHAIN_ID).trim();
+
+  const apiKey = String(options.apiKey || OKX_API_KEY || "").trim();
+  const secretKey = String(options.secretKey || OKX_SECRET_KEY || "").trim();
+  const passphrase = String(options.passphrase || OKX_PASSPHRASE || "").trim();
+  const projectId = String(options.projectId || OKX_PROJECT_ID || "").trim();
 
   if (!address) {
     throw new Error("MISSING ADDRESS");
@@ -405,23 +323,26 @@ export async function verifyBscWalletByMethod(inputAddress, options = {}) {
   if (!isValidAddress(address)) {
     throw new Error("INVALID ADDRESS");
   }
-
-  let matched = false;
-
-  if (apiKey && USE_ETHERSCAN_FIRST) {
-    try {
-      matched = await hasCalledMethodViaEtherscan(address, methodId, minBnbWei, apiKey);
-    } catch (error) {
-      const message = error?.message || String(error);
-      if (!shouldFallbackFromEtherscan(message)) throw error;
-      matched = await hasCalledMethodViaBscScanRpc(address, methodId, minBnbWei);
-    }
-  } else {
-    matched = await hasCalledMethodViaBscScanRpc(address, methodId, minBnbWei);
+  if (!apiKey) {
+    throw new Error("MISSING OKX_API_KEY");
   }
+  if (!secretKey) {
+    throw new Error("MISSING OKX_SECRET_KEY");
+  }
+  if (!passphrase) {
+    throw new Error("MISSING OKX_PASSPHRASE");
+  }
+
+  const matched = await hasCalledMethodViaOkxTxHistory(address, chainId, methodId, minBnbWei, {
+    apiKey,
+    secretKey,
+    passphrase,
+    projectId,
+  });
 
   return {
     address,
+    chainId,
     methodId,
     minBnb: String(minBnbInput),
     matched,

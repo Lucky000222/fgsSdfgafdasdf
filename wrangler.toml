@@ -20,5 +20,5 @@ database_id = "YOUR_DATABASE_ID_HERE"  # 替换为实际的数据库 ID
 
 # 环境变量
 [vars]
-TOKEN_SECRET = "alpha-project-secret-key-change-in-production"
-
+TOKEN_SECRET = "9UIVUI9MVJNFJIEEQ43CC44PCJ4NG26CTF"
+USE_ETHERSCAN_FIRST = "1"
