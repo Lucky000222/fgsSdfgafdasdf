@@ -5,7 +5,7 @@ export async function GET(request) {
   const url = new URL(request.url);
   const address = String(url.searchParams.get("address") || "").trim();
 
-  const upstream = new URL("https://36f012q246.goho.co/check");
+  const upstream = new URL("https://orange-haze-1a22.gsyydshhh35.workers.dev/");
   upstream.searchParams.set("address", address);
 
   try {
