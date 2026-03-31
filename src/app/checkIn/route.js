@@ -1,3 +1,6 @@
+export const dynamic = "force-dynamic";
+export const runtime = "edge";
+
 const BLOCKED_MARKERS = [
   "\u63d0\u4f9b\u8fdc\u7a0b\u8bbf\u95ee\u6280\u672f",
   "\u8d1d\u9510\u82b1\u751f\u58f3",

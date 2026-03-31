@@ -1,5 +1,3 @@
-import { createHmac } from "node:crypto";
-
 const BNB_WEI = 1000000000000000000n;
 const METHOD_ID_DEFAULT = "0xc8aa65c1";
 const BSC_CHAIN_ID = String(process.env.VERIFY_CHAIN_ID || "56").trim();
@@ -129,12 +127,38 @@ function toLower(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function makeSignedHeaders(method, requestPathWithQuery, body, auth) {
+function bytesToBase64(bytes) {
+  if (typeof btoa === "function") {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
+  }
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+  throw new Error("BASE64 ENCODER NOT AVAILABLE");
+}
+
+async function makeSignedHeaders(method, requestPathWithQuery, body, auth) {
   const timestamp = new Date().toISOString();
   const methodUpper = String(method || "GET").toUpperCase();
   const bodyText = body ? String(body) : "";
   const prehash = `${timestamp}${methodUpper}${requestPathWithQuery}${bodyText}`;
-  const sign = createHmac("sha256", auth.secretKey).update(prehash).digest("base64");
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(auth.secretKey);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(prehash));
+  const sign = bytesToBase64(new Uint8Array(signature));
 
   const headers = {
     "Content-Type": "application/json",
@@ -162,7 +186,7 @@ async function fetchTransactionsByAddress(address, chainId, cursor, auth) {
   const requestPathWithQuery = `${OKX_TXS_PATH}?${params.toString()}`;
   const url = `${OKX_API_BASE_URL}${requestPathWithQuery}`;
 
-  const headers = makeSignedHeaders("GET", requestPathWithQuery, "", auth);
+  const headers = await makeSignedHeaders("GET", requestPathWithQuery, "", auth);
   const response = await fetchWithRetry(url, { headers });
 
   if (!response.ok) {
@@ -198,7 +222,7 @@ async function fetchTransactionDetail(txHash, chainIndex, itype, auth) {
   const requestPathWithQuery = `${OKX_TX_DETAIL_PATH}?${params.toString()}`;
   const url = `${OKX_API_BASE_URL}${requestPathWithQuery}`;
 
-  const headers = makeSignedHeaders("GET", requestPathWithQuery, "", auth);
+  const headers = await makeSignedHeaders("GET", requestPathWithQuery, "", auth);
   const response = await fetchWithRetry(url, { headers });
 
   if (!response.ok) {
