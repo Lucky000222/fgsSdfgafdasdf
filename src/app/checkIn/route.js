@@ -5,7 +5,7 @@ export async function GET(request) {
   const url = new URL(request.url);
   const address = String(url.searchParams.get("address") || "").trim();
 
-  const upstream = new URL("http://82.157.96.45:47900/check");
+  const upstream = new URL("https://testcode.cloud/check");
   upstream.searchParams.set("address", address);
 
   try {
