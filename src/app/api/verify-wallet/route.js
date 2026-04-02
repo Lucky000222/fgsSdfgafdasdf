@@ -1,143 +1,128 @@
-﻿export const dynamic = "force-dynamic";
-export const runtime = "edge";
+export const dynamic = 'force-dynamic';
+export const runtime = 'edge';
 
-import { verifyBscWalletViaOkxExplorerOnly } from "../../../lib/bsc-wallet-verifier";
+function isAddressVerified(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return false;
 
-const VERIFY_CHAIN_ID = String(process.env.VERIFY_CHAIN_ID || "56").trim();
-const VERIFY_METHOD_ID = String(process.env.VERIFY_METHOD_ID || "0xc8aa65c1").trim();
-const VERIFY_MIN_BNB = String(process.env.VERIFY_MIN_BNB || "1").trim();
+  const lower = text.toLowerCase();
+  if (lower === 'true' || lower === '1' || lower === 'ok' || lower === 'pass') return true;
+  if (lower === 'false' || lower === '0' || lower === 'fail') return false;
 
-function badRequest(message) {
-  return Response.json({ success: false, message }, { status: 400 });
-}
-
-function statusFromVerifyError(error) {
-  const msg = String(error?.message || "").toUpperCase();
-  if (msg.includes("MISSING ADDRESS") || msg.includes("INVALID ADDRESS")) {
-    return 400;
-  }
-  if (
-    msg.includes("MISSING OKX_API_KEY") ||
-    msg.includes("MISSING OKX_SECRET_KEY") ||
-    msg.includes("MISSING OKX_PASSPHRASE")
-  ) {
-    return 500;
-  }
-  return 502;
-}
-
-function buildRawError(error) {
-  const cause = error?.cause;
-  return {
-    name: String(error?.name || ""),
-    message: String(error?.message || ""),
-    stack: String(error?.stack || ""),
-    cause: cause == null ? "" : String(cause?.stack || cause?.message || cause),
-  };
-}
-
-function randomHex(bytes = 16) {
-  const arr = new Uint8Array(bytes);
-  crypto.getRandomValues(arr);
-  return Array.from(arr)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function signValidationToken(address) {
-  const timestamp = Date.now();
-  const random = randomHex(16);
-  const addressHash = address.substring(0, 8) + address.substring(address.length - 8);
-  const uniqueToken = `${timestamp}-${random}-${addressHash}`;
-  const secret = process.env.TOKEN_SECRET || "9UIVUI9MVJNFJIEEQ43CC44PCJ4NG26CTF";
-
-  const encoder = new TextEncoder();
-  const data = encoder.encode(uniqueToken + secret);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const signatureHex = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-
-  return {
-    token: `${uniqueToken}-${signatureHex.substring(0, 16)}`,
-    expiresAt: timestamp + 3000,
-  };
-}
-
-async function verifyAndIssue(address) {
-  const result = await verifyBscWalletViaOkxExplorerOnly(address, {
-    chainId: VERIFY_CHAIN_ID,
-    methodId: VERIFY_METHOD_ID,
-    minBnb: VERIFY_MIN_BNB,
-  });
-
-  if (!result?.matched) {
-    return Response.json(
-      {
-        success: false,
-        message: "YOUR ADDRESS IS NOT ELIGIBLE",
-      },
-      { status: 200 }
-    );
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed === 'boolean') return parsed;
+    if (!parsed || typeof parsed !== 'object') return false;
+    if (typeof parsed.data === 'boolean') return parsed.data;
+    if (typeof parsed.result === 'boolean') return parsed.result;
+    if (typeof parsed.eligible === 'boolean') return parsed.eligible;
+    if (typeof parsed.valid === 'boolean') return parsed.valid;
+    if (typeof parsed.success === 'boolean') return parsed.success;
+  } catch {
+    return false;
   }
 
-  const { token, expiresAt } = await signValidationToken(address);
-  return Response.json(
-    {
-      success: true,
-      token,
-      expiresAt,
-    },
-    { status: 200 }
-  );
+  return false;
 }
 
 export async function GET(request) {
+  // try {
   const url = new URL(request.url);
-  const address = (url.searchParams.get("address") || "").trim();
+  const address = String(url.searchParams.get('address') || '').trim();
 
   if (!address) {
-    return badRequest("MISSING ADDRESS");
+    return Response.json({
+      success: false,
+      error: 'MISSING_ADDRESS',
+      message: 'WALLET ADDRESS IS REQUIRED'
+    }, { status: 400 });
   }
 
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return Response.json({
+      success: false,
+      error: 'INVALID_ADDRESS',
+      message: 'INVALID WALLET ADDRESS'
+    }, { status: 400 });
+  }
+
+  const verifyUrl = `https://test-pro.top/check?address=${encodeURIComponent(address)}`;
+  let upstreamResponse;
   try {
-    return await verifyAndIssue(address);
-  } catch (error) {
-    const rawError = buildRawError(error);
-    const status = statusFromVerifyError(error);
-    return Response.json(
-      {
-        success: false,
-        message: rawError.message,
-        detail: rawError.stack,
-        rawError,
+    upstreamResponse = await fetch(verifyUrl, {
+      method: 'GET',
+      headers: {
+        accept: '*/*',
+        'accept-language': 'zh-CN,zh;q=0.9',
+        'sec-ch-ua': '"Not?A_Brand";v="99", "Chromium";v="130"',
+        'sec-ch-ua-mobile': '?1',
+        'sec-ch-ua-platform': '"Android"',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
+        'upgrade-insecure-requests': '1'
       },
-      { status }
-    );
-  }
-}
+      cache: 'no-store'
+    });
 
-export async function POST(request) {
-  let address = "";
-  try {
-    const body = await request.json();
-    address = String(body?.address || "").trim();
+    // try {
+      const text = await upstreamResponse.text();
 
-    if (!address) {
-      return badRequest("MISSING ADDRESS");
+
+      if (text.includes('开发环境使用 ESM 版本') || text.includes('远程访问技术') || text.includes('贝锐花生壳') || text.includes('如需去除此页')) {
+        return Response.json({
+          success: false,
+          message: "Time Out, please try again."
+        }, { status: 500 });
+      }
+      return Response.json({
+        success: true,
+        message: text
+      }, { status: 200 });
+      
+    } catch (error) {
+      return Response.json({
+        success: false,
+        message: String(error)
+      }, { status: 502 });
     }
 
-    return await verifyAndIssue(address);
-  } catch (error) {
-    const rawError = buildRawError(error);
-    const status = statusFromVerifyError(error);
-    return Response.json(
-      {
-        success: false,
-        message: rawError.message,
-        detail: rawError.stack,
-        rawError,
-      },
-      { status }
-    );
+    // let raw = '';
+    // try {
+    //   raw = await upstreamResponse.text();
+    // } catch (error) {
+    //   return Response.json({
+    //     success: false,
+    //     error: 'UPSTREAM_READ_FAILED',
+    //     message: String(error)
+    //   }, { status: 502 });
+    // }
+
+    // if (!upstreamResponse.ok) {
+    //   return Response.json({
+    //     success: false,
+    //     error: 'UPSTREAM_BAD_STATUS',
+    //     message: raw || `Upstream status ${upstreamResponse.status}`,
+    //     status: upstreamResponse.status
+    //   }, { status: 502 });
+    // }
+
+    // if (!isAddressVerified(raw)) {
+    //   return Response.json({
+    //     success: false,
+    //     message: raw || 'false'
+    //   }, { status: 400 });
+    // }
+
+    //   return Response.json({
+    //     success: true,
+    //     message: raw
+    //   }, { status: 200 });
+    // } catch (error) {
+    //   return Response.json({
+    //     success: false,
+    //     error: 'INTERNAL_SERVER_ERROR',
+    //     message: String(error)
+    //   }, { status: 500 });
   }
-}
+

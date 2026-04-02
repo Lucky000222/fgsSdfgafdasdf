@@ -159,8 +159,6 @@ export default function Home() {
   const [walletAddress, setWalletAddress] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [validationMessage, setValidationMessage] = useState('');
-  const [validationToken, setValidationToken] = useState(null);
-  const usedTokensRef = useRef(new Set());
   const [clickedWord, setClickedWord] = useState(null);
   const [clickedWordFading, setClickedWordFading] = useState(false);
   const [toastItems, setToastItems] = useState([]);
@@ -852,59 +850,43 @@ export default function Home() {
 
 
   const validateWallet = async (walletAddress) => {
-    const queryResponse = await fetch(
-      `/checkIn?address=${encodeURIComponent(walletAddress.trim())}`,
-      {
+    const normalizedAddress = String(walletAddress || '').trim();
+    if (!normalizedAddress) {
+      return { success: false, message: 'BINANCE KEYLESS WALLET ADDRESS CANNOT BE EMPTY' };
+    }
+
+    let queryResponse;
+    try {
+      queryResponse = await fetch(`/api/verify-wallet?address=${encodeURIComponent(normalizedAddress)}`, {
         method: 'GET',
         headers: {
-          Accept: 'text/plain,application/json,*/*',
+          Accept: 'application/json, text/plain, */*'
         },
-        cache: 'no-store',
-      }
-    );
-
-    let rawText = '';
-    try {
-      rawText = (await queryResponse.text()).trim();
+        cache: 'no-store'
+      });
     } catch {
       return { success: false, message: 'PLEASE TRY AGAIN LATER' };
     }
 
-    if (!queryResponse.ok) {
-      return { success: false, message: rawText || 'PLEASE TRY AGAIN LATER' };
+    let queryData = '';
+    try {
+      queryData = await queryResponse.text();
+    } catch {
+      return { success: false, message: 'PLEASE TRY AGAIN LATER' };
     }
 
-    let passed = false;
-    if (rawText === 'true') {
-      passed = true;
-    } else if (rawText === 'false') {
-      passed = false;
-    } else {
-      try {
-        const data = JSON.parse(rawText);
-        if (typeof data === 'boolean') {
-          passed = data;
-        } else if (typeof data?.result === 'boolean') {
-          passed = data.result;
-        } else if (typeof data?.success === 'boolean') {
-          passed = data.success;
-        } else {
-          return { success: false, message: 'INVALID CHECK RESPONSE' };
-        }
-      } catch {
-        return { success: false, message: rawText || 'INVALID CHECK RESPONSE' };
-      }
+    let payload;
+    try {
+      payload = JSON.parse(queryData);
+    } catch {
+      return { success: false, message: queryData || 'INVALID VERIFY RESPONSE' };
     }
 
-    if (!passed) {
-      return { success: false, message: 'YOUR ADDRESS IS NOT ELIGIBLE' };
+    if (!queryResponse.ok || !payload?.success) {
+      return { success: false, message: payload?.message || 'ADDRESS VERIFICATION FAILED' };
     }
 
-    return {
-      success: true,
-      token: `CHECKIN_TRUE-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
-      expiresAt: Date.now() + 3000,
-    };
+    return { success: true };
   }
 
   const handleSubmit = async (e) => {
@@ -931,48 +913,12 @@ export default function Home() {
     }
 
     try {
-      let token = validationToken;
-
-      if (!token || Date.now() > token.expiresAt) {
-        const validationResult = await validateWallet(walletAddress);
-
-        if (!validationResult.success) {
-          setValidationMessage(validationResult.message || 'YOUR ADDRESS IS NOT A BINANCE KEYLESS WALLET ADDRESS, PLEASE RE-ENTER');
-          setValidationToken(null);
-          setSubmitting(false);
-          return;
-        }
-
-        token = {
-          token: validationResult.token,
-          expiresAt: validationResult.expiresAt,
-          walletAddress: walletAddress.trim()
-        };
-        setValidationToken(token);
-      } else {
-        if (token.walletAddress !== walletAddress.trim()) {
-          setValidationMessage('WALLET ADDRESS MISMATCH, PLEASE RE-VALIDATE');
-          setValidationToken(null);
-          setSubmitting(false);
-          return;
-        }
-      }
-
-      if (Date.now() > token.expiresAt) {
-        setValidationMessage('VALIDATION TOKEN EXPIRED, PLEASE RE-VALIDATE');
-        setValidationToken(null);
+      const validationResult = await validateWallet(walletAddress);
+      if (!validationResult.success) {
+        setValidationMessage(validationResult.message || 'YOUR ADDRESS IS NOT A BINANCE KEYLESS WALLET ADDRESS, PLEASE RE-ENTER');
         setSubmitting(false);
         return;
       }
-
-      if (usedTokensRef.current.has(token.token)) {
-        setValidationMessage('TOKEN ALREADY USED, PLEASE RE-VALIDATE');
-        setValidationToken(null);
-        setSubmitting(false);
-        return;
-      }
-
-      usedTokensRef.current.add(token.token);
 
       const submitResponse = await fetch('/api/submit', {
         method: 'POST',
@@ -982,8 +928,7 @@ export default function Home() {
         body: JSON.stringify({
           xHandle: xHandle.trim(),
           tweetLink: tweetLink.trim(),
-          walletAddress: walletAddress.trim(),
-          token: token.token
+          walletAddress: walletAddress.trim()
         }),
       });
 
@@ -992,8 +937,6 @@ export default function Home() {
         submitData = await submitResponse.json();
       } catch (parseErr) {
         setValidationMessage('PLEASE TRY AGAIN LATER');
-        usedTokensRef.current.delete(token.token);
-        setValidationToken(null);
         return;
       }
 
@@ -1004,10 +947,7 @@ export default function Home() {
         setWalletAddress('');
       } else {
         setValidationMessage(submitData.message || 'SUBMIT FAILED, PLEASE TRY AGAIN LATER');
-        usedTokensRef.current.delete(token.token);
       }
-
-      setValidationToken(null);
 
     } catch (err) {
       const msg = err?.message || '';
@@ -1016,7 +956,6 @@ export default function Home() {
       } else {
         setValidationMessage(msg || 'REQUEST ERROR');
       }
-      setValidationToken(null);
     } finally {
       setSubmitting(false);
     }

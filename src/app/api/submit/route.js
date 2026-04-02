@@ -4,69 +4,21 @@ export const runtime = 'edge';
 export async function POST(request, context) {
   try {
     const body = await request.json();
-    const { xHandle, tweetLink, walletAddress, token } = body;
+    const { xHandle, tweetLink, walletAddress } = body;
+    const normalizedAddress = String(walletAddress || '').trim();
 
-    if (!xHandle || !tweetLink || !walletAddress || !token) {
+    if (!xHandle || !tweetLink || !normalizedAddress) {
       return Response.json({
         error: 'Missing required fields',
         message: 'null'
       }, { status: 400 });
     }
 
-    const bypassToken = String(token).startsWith('CHECKIN_TRUE-');
-    if (!bypassToken) {
-      const tokenParts = token.split('-');
-      if (tokenParts.length < 4) {
-        return Response.json({
-          error: 'Invalid token format',
-          message: 'INVALID TOKEN FORMAT'
-        }, { status: 400 });
-      }
-
-      const timestamp = parseInt(tokenParts[0]);
-      const currentTime = Date.now();
-      const expiresAt = timestamp + 3000;
-
-      if (currentTime > expiresAt) {
-        return Response.json({
-          error: 'Token expired',
-          message: 'TOKEN HAS EXPIRED, PLEASE RE-VALIDATE'
-        }, { status: 400 });
-      }
-
-      const tokenAge = currentTime - timestamp;
-      if (tokenAge > 3000) {
-        return Response.json({
-          error: 'Token too old',
-          message: 'TOKEN IS TOO OLD, PLEASE RE-VALIDATE'
-        }, { status: 400 });
-      }
-
-      const addressHash = tokenParts[2];
-      const expectedHash = walletAddress.substring(0, 8) + walletAddress.substring(walletAddress.length - 8);
-
-      if (addressHash !== expectedHash) {
-        return Response.json({
-          error: 'Token wallet mismatch',
-          message: 'TOKEN WALLET ADDRESS MISMATCH'
-        }, { status: 400 });
-      }
-
-      const secret = process.env.TOKEN_SECRET || '9UIVUI9MVJNFJIEEQ43CC44PCJ4NG26CTF';
-      const uniqueToken = `${tokenParts[0]}-${tokenParts[1]}-${tokenParts[2]}`;
-      const encoder = new TextEncoder();
-      const data = encoder.encode(uniqueToken + secret);
-      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-      const hashArray = Array.from(new Uint8Array(hashBuffer));
-      const signatureHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-      const expectedSignature = signatureHex.substring(0, 16);
-
-      if (tokenParts[3] !== expectedSignature) {
-        return Response.json({
-          error: 'Invalid token signature',
-          message: 'INVALID TOKEN SIGNATURE'
-        }, { status: 400 });
-      }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(normalizedAddress)) {
+      return Response.json({
+        error: 'Invalid wallet address',
+        message: 'INVALID WALLET ADDRESS'
+      }, { status: 400 });
     }
 
     const db = context?.env?.DB || process.env.DB;
@@ -75,7 +27,7 @@ export async function POST(request, context) {
       try {
         const existing = await db.prepare(
           'SELECT id FROM submissions WHERE wallet_address = ?'
-        ).bind(walletAddress.trim()).first();
+        ).bind(normalizedAddress).first();
 
         if (existing) {
           return Response.json({
@@ -88,14 +40,14 @@ export async function POST(request, context) {
           `INSERT INTO submissions (wallet_address, x_handle, tweet_link, submitted_at) 
            VALUES (?, ?, ?, ?)`
         ).bind(
-          walletAddress.trim(),
+          normalizedAddress,
           xHandle.trim(),
           tweetLink.trim(),
           new Date().toISOString()
         ).run();
 
         console.log('Data stored to D1:', {
-          walletAddress: walletAddress.trim(),
+          walletAddress: normalizedAddress,
           xHandle: xHandle.trim(),
           tweetLink: tweetLink.trim()
         });
@@ -107,7 +59,7 @@ export async function POST(request, context) {
 
       if (kv) {
         try {
-          const existing = await kv.get(walletAddress.trim());
+          const existing = await kv.get(normalizedAddress);
           if (existing) {
             return Response.json({
               error: 'Address already submitted',
@@ -116,14 +68,14 @@ export async function POST(request, context) {
           }
 
           const submissionData = JSON.stringify({
-            walletAddress: walletAddress.trim(),
+            walletAddress: normalizedAddress,
             xHandle: xHandle.trim(),
             tweetLink: tweetLink.trim(),
             submittedAt: new Date().toISOString()
           });
 
-          await kv.put(walletAddress.trim(), submissionData);
-          console.log('Data stored to KV:', walletAddress.trim());
+          await kv.put(normalizedAddress, submissionData);
+          console.log('Data stored to KV:', normalizedAddress);
         } catch (kvError) {
           console.error('KV storage error:', kvError);
         }
@@ -135,8 +87,7 @@ export async function POST(request, context) {
     console.log('Submit successful:', {
       xHandle: xHandle.trim(),
       tweetLink: tweetLink.trim(),
-      walletAddress: walletAddress.trim(),
-      token
+      walletAddress: normalizedAddress
     });
 
     return Response.json({
@@ -152,3 +103,4 @@ export async function POST(request, context) {
     }, { status: 500 });
   }
 }
+
