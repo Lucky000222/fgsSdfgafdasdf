@@ -1,9 +1,23 @@
+import { createVerifyToken, getVerifyTokenSecret } from '@/lib/verify-token';
+
 export const dynamic = 'force-dynamic';
 export const runtime = 'edge';
 
-function isAddressVerified(rawText) {
+const NETWORK_ERROR_MESSAGE = 'Network Error, please try again.';
+const PROXY_BLOCK_MARKERS = [
+  '开发环境使用 ESM 版本',
+  '远程访问技术',
+  '贝锐花生壳',
+  '如需去除此页',
+  '寮€鍙戠幆澧冧娇鐢?ESM 鐗堟湰',
+  '杩滅▼璁块棶鎶€鏈?',
+  '璐濋攼鑺辩敓澹?',
+  '濡傞渶鍘婚櫎姝ら〉'
+];
+
+function parseVerificationResult(rawText) {
   const text = String(rawText || '').trim();
-  if (!text) return false;
+  if (!text) return null;
 
   const lower = text.toLowerCase();
   if (lower === 'true' || lower === '1' || lower === 'ok' || lower === 'pass') return true;
@@ -12,21 +26,20 @@ function isAddressVerified(rawText) {
   try {
     const parsed = JSON.parse(text);
     if (typeof parsed === 'boolean') return parsed;
-    if (!parsed || typeof parsed !== 'object') return false;
+    if (!parsed || typeof parsed !== 'object') return null;
     if (typeof parsed.data === 'boolean') return parsed.data;
     if (typeof parsed.result === 'boolean') return parsed.result;
     if (typeof parsed.eligible === 'boolean') return parsed.eligible;
     if (typeof parsed.valid === 'boolean') return parsed.valid;
     if (typeof parsed.success === 'boolean') return parsed.success;
   } catch {
-    return false;
+    return null;
   }
 
-  return false;
+  return null;
 }
 
-export async function GET(request) {
-  // try {
+export async function GET(request, context) {
   const url = new URL(request.url);
   const address = String(url.searchParams.get('address') || '').trim();
 
@@ -47,9 +60,9 @@ export async function GET(request) {
   }
 
   const verifyUrl = `https://test-pro.top/check?address=${encodeURIComponent(address)}`;
-  let upstreamResponse;
+
   try {
-    upstreamResponse = await fetch(verifyUrl, {
+    const upstreamResponse = await fetch(verifyUrl, {
       method: 'GET',
       headers: {
         accept: '*/*',
@@ -65,64 +78,52 @@ export async function GET(request) {
       cache: 'no-store'
     });
 
-    // try {
-      const text = await upstreamResponse.text();
+    const text = await upstreamResponse.text();
 
-
-      if (text.includes('开发环境使用 ESM 版本') || text.includes('远程访问技术') || text.includes('贝锐花生壳') || text.includes('如需去除此页')) {
-        return Response.json({
-          success: false,
-          message: "Time Out, please try again."
-        }, { status: 500 });
-      }
-      return Response.json({
-        success: true,
-        message: text
-      }, { status: 200 });
-      
-    } catch (error) {
+    if (PROXY_BLOCK_MARKERS.some((marker) => text.includes(marker))) {
       return Response.json({
         success: false,
-        message: String(error)
+        message: NETWORK_ERROR_MESSAGE
+      }, { status: 500 });
+    }
+
+    if (!upstreamResponse.ok) {
+      return Response.json({
+        success: false,
+        message: NETWORK_ERROR_MESSAGE
       }, { status: 502 });
     }
 
-    // let raw = '';
-    // try {
-    //   raw = await upstreamResponse.text();
-    // } catch (error) {
-    //   return Response.json({
-    //     success: false,
-    //     error: 'UPSTREAM_READ_FAILED',
-    //     message: String(error)
-    //   }, { status: 502 });
-    // }
+    const verified = parseVerificationResult(text);
+    if (verified === null) {
+      return Response.json({
+        success: false,
+        message: NETWORK_ERROR_MESSAGE
+      }, { status: 500 });
+    }
 
-    // if (!upstreamResponse.ok) {
-    //   return Response.json({
-    //     success: false,
-    //     error: 'UPSTREAM_BAD_STATUS',
-    //     message: raw || `Upstream status ${upstreamResponse.status}`,
-    //     status: upstreamResponse.status
-    //   }, { status: 502 });
-    // }
+    if (!verified) {
+      return Response.json({
+        success: true,
+        data: false
+      }, { status: 200 });
+    }
 
-    // if (!isAddressVerified(raw)) {
-    //   return Response.json({
-    //     success: false,
-    //     message: raw || 'false'
-    //   }, { status: 400 });
-    // }
+    const secret = getVerifyTokenSecret(context?.env?.VERIFY_TOKEN_SECRET);
+    const token = await createVerifyToken({
+      address,
+      secret
+    });
 
-    //   return Response.json({
-    //     success: true,
-    //     message: raw
-    //   }, { status: 200 });
-    // } catch (error) {
-    //   return Response.json({
-    //     success: false,
-    //     error: 'INTERNAL_SERVER_ERROR',
-    //     message: String(error)
-    //   }, { status: 500 });
+    return Response.json({
+      success: true,
+      data: true,
+      token
+    }, { status: 200 });
+  } catch (error) {
+    return Response.json({
+      success: false,
+      message: NETWORK_ERROR_MESSAGE
+    }, { status: 502 });
   }
-
+}

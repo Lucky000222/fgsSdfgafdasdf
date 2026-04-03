@@ -849,6 +849,19 @@ export default function Home() {
   };
 
 
+  const NETWORK_ERROR_MESSAGE = 'Network Error, please try again.';
+  const NOT_ELIGIBLE_MESSAGE = 'YOUR ADDRESS IS NOT A BINANCE KEYLESS WALLET ADDRESS, PLEASE RE-ENTER';
+
+  const parseVerifyResult = (value) => {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true') return true;
+      if (normalized === 'false') return false;
+    }
+    return null;
+  };
+
   const validateWallet = async (walletAddress) => {
     const normalizedAddress = String(walletAddress || '').trim();
     if (!normalizedAddress) {
@@ -865,29 +878,42 @@ export default function Home() {
         cache: 'no-store'
       });
     } catch {
-      return { success: false, message: 'PLEASE TRY AGAIN LATER' };
+      return { success: false, message: NETWORK_ERROR_MESSAGE };
     }
 
     let queryData = '';
     try {
       queryData = await queryResponse.text();
     } catch {
-      return { success: false, message: 'PLEASE TRY AGAIN LATER' };
+      return { success: false, message: NETWORK_ERROR_MESSAGE };
     }
 
     let payload;
     try {
       payload = JSON.parse(queryData);
     } catch {
-      return { success: false, message: queryData || 'INVALID VERIFY RESPONSE' };
+      return { success: false, message: NETWORK_ERROR_MESSAGE };
     }
 
-    if (!queryResponse.ok || !payload?.success) {
-      return { success: false, message: payload?.message || 'ADDRESS VERIFICATION FAILED' };
+    if (!queryResponse.ok || payload?.success !== true) {
+      return { success: false, message: NETWORK_ERROR_MESSAGE };
     }
 
-    return { success: true };
-  }
+    const verifyResult = parseVerifyResult(payload?.data);
+    if (verifyResult === true) {
+      const verifyToken = typeof payload?.token === 'string' ? payload.token.trim() : '';
+      if (!verifyToken) {
+        return { success: false, message: NETWORK_ERROR_MESSAGE };
+      }
+      return { success: true, token: verifyToken };
+    }
+
+    if (verifyResult === false) {
+      return { success: false, message: NOT_ELIGIBLE_MESSAGE };
+    }
+
+    return { success: false, message: NETWORK_ERROR_MESSAGE };
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -920,6 +946,13 @@ export default function Home() {
         return;
       }
 
+      const verifyToken = String(validationResult.token || '').trim();
+      if (!verifyToken) {
+        setValidationMessage(NETWORK_ERROR_MESSAGE);
+        setSubmitting(false);
+        return;
+      }
+
       const submitResponse = await fetch('/api/submit', {
         method: 'POST',
         headers: {
@@ -928,7 +961,8 @@ export default function Home() {
         body: JSON.stringify({
           xHandle: xHandle.trim(),
           tweetLink: tweetLink.trim(),
-          walletAddress: walletAddress.trim()
+          walletAddress: walletAddress.trim(),
+          verifyToken
         }),
       });
 

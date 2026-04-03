@@ -1,0 +1,436 @@
+﻿// SPDX-License-Identifier: MIT
+// 指定 Solidity 编译器版本为 0.8.20。
+pragma solidity ^0.8.20;
+
+// 引入 OpenZeppelin 的 ERC20 标准实现。
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+// 引入 IERC20/SafeERC20，用于提取任意 ERC20 代币（如 USDT）。
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+// 引入 Ownable，用于管理员权限控制。
+import "@openzeppelin/contracts/access/Ownable.sol";
+// 引入重入保护，防止带转账的函数被重入攻击。
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+// 引入 MerkleProof，用于白名单校验。
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+/**
+ * @title AlphaAllInOne
+ * @notice 这是把原来的 ALToken + AlphaMint 合并后的单合约版本。
+ * @notice 这个合约同时承担 4 件事：
+ * @notice 1. 它本身就是 ERC20 代币合约。
+ * @notice 2. 它负责白名单免费发放兑换额度。
+ * @notice 3. 它负责接收 BNB 并记录用户购买额度。
+ * @notice 4. 它负责把 claimable 额度兑换成真实 AL 代币。
+ *
+ * @notice 和双合约版相比，这里最关键的区别是：
+ * @notice 1. 真实代币和 Mint 逻辑都在同一个 contract 里。
+ * @notice 2. swapToAL 不再调用外部 alToken.transfer，而是直接在本合约内部做 _transfer。
+ * @notice 3. 兑换前，这个合约地址自己必须先持有足够的 AL 余额。
+ * @notice 4. 如果初始代币铸造给 owner，那么 owner 需要先把一部分 AL 转到本合约地址，用户才能 swap。
+ *
+ * @notice 这版更简单，部署也只要一个合约。
+ * @notice 但职责更集中，后续升级和审计时会比双合约版更耦合。
+ */
+contract AlphaAllInOne is ERC20, Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // AL 最大总供应：100,000,000 * 1e18。
+    uint256 public constant MAX_SUPPLY = 100_000_000 * 1e18;
+    // 兑换池初始储备：75,000,000 * 1e18（留在合约地址里）。
+    uint256 public constant SWAP_POOL_SUPPLY = 75_000_000 * 1e18;
+    // 管理员初始持有：25,000,000 * 1e18。
+    uint256 public constant OWNER_SUPPLY = 25_000_000 * 1e18;
+
+    // 保存白名单 Merkle Root，用于校验白名单地址。
+    bytes32 public merkleRoot;
+    // 控制是否允许用户把额度兑换成真实 AL。
+    bool public swapEnabled;
+    // 控制是否接收付款（buyWithBNB/receive 总开关）。
+    bool public paymentEnabled = true;
+    // 收款模式：
+    // 1 = 收款并计入付费额度池；
+    // 2 = 收款但不计入付费额度池（仅记入不计额度桶，供退款）。
+    uint8 public paymentMode = 1;
+    // 控制是否允许用户退款 BNB。
+    bool public refundEnabled;
+    // 退款模式：
+    // 1 = 仅可退“兑换前打款”(拥有付费额度来源)；
+    // 2 = 仅可退“不计入付费额度池”的打款；
+    // 3 = 两类都可退。
+    uint8 public refundMode = 1;
+
+    // 白名单免费额度上限。
+    uint256 public freeMintCap;
+    // 支付 BNB 购买额度上限。
+    uint256 public paidMintCap;
+    // 白名单每次固定领取额度（不再由用户调用时传入）。
+    uint256 public whitelistMintAmount;
+
+    // 所有方式累计得到的总额度。
+    uint256 public totalMinted;
+    // 白名单免费得到的累计额度。
+    uint256 public totalMintedFree;
+    // 支付 BNB 占比结算后，已兑换的累计额度。
+    uint256 public totalMintedPaid;
+
+    // 合约累计收到的 BNB 总量。
+    uint256 public totalBnbContributed;
+
+    // 记录每个地址总共获得过多少额度。
+    mapping(address => uint256) public mintedBy;
+    // 记录每个地址通过白名单免费获得了多少额度。
+    mapping(address => uint256) public mintedFreeBy;
+    // 记录每个地址通过支付 BNB 占比结算后已兑换了多少额度。
+    mapping(address => uint256) public mintedPaidBy;
+    // 记录每个地址累计支付了多少 BNB。
+    // 该值仅记录“兑换前打款”，用于付费占比额度计算。
+    mapping(address => uint256) public bnbContributed;
+    // 记录每个地址累计打入且“不计入付费额度池”的 BNB。
+    mapping(address => uint256) public bnbContributedAfterSwap;
+    // 记录每个地址“兑换前打款”已退款了多少 BNB。
+    mapping(address => uint256) public refundedBeforeSwapBy;
+    // 记录每个地址“兑换后打款”已退款了多少 BNB。
+    mapping(address => uint256) public refundedAfterSwapBy;
+
+    // 记录每个地址当前还剩多少可兑换 AL 的额度。
+    mapping(address => uint256) public claimable;
+    mapping(address => bool) public blacklist;
+
+    /**
+     * @notice 构造函数：初始化代币信息、初始供应量、白名单根、额度上限和 owner。
+     * @param initialSupply 初始发行量，建议调用时自行带上 18 位精度。
+     * @param merkleRoot_ 白名单树根。
+     * @param freeMintCap_ 白名单免费额度上限。
+     * @param paidMintCap_ 支付 BNB 购买额度上限。
+     * @param whitelistMintAmount_ 白名单每次固定领取额度。
+     * @param owner_ 管理员地址，同时也接收初始铸造的代币。
+     */
+    constructor(
+        // 初始发行量。
+        uint256 initialSupply,
+        // 白名单根。
+        bytes32 merkleRoot_,
+        // 免费额度上限。
+        uint256 freeMintCap_,
+        // 付费额度上限。
+        uint256 paidMintCap_,
+        // 白名单每次固定领取额度。
+        uint256 whitelistMintAmount_,
+        // owner 地址。
+        address owner_
+    ) ERC20("Alpha Token", "AL") Ownable(owner_) {
+        // 部署时固定总供应必须为 100,000,000 * 1e18。
+        require(initialSupply == MAX_SUPPLY, "initialSupply must be 100m");
+        // 免费+付费可兑换上限不能超过 75,000,000 * 1e18 的兑换池。
+        require(freeMintCap_ + paidMintCap_ <= SWAP_POOL_SUPPLY, "caps exceed swap pool");
+        // 白名单固定领取额度必须大于 0。
+        require(whitelistMintAmount_ > 0, "whitelistMintAmount=0");
+
+        // 保存白名单根。
+        merkleRoot = merkleRoot_;
+        // 保存免费额度上限。
+        freeMintCap = freeMintCap_;
+        // 保存付费额度上限。
+        paidMintCap = paidMintCap_;
+        // 保存白名单固定领取额度。
+        whitelistMintAmount = whitelistMintAmount_;
+        // 75,000,000 AL 先放入合约地址，给后续 swapToAL 兑付使用。
+        _mint(address(this), SWAP_POOL_SUPPLY);
+        // 25,000,000 AL 发给管理员地址。
+        _mint(owner_, OWNER_SUPPLY);
+    }
+
+    /**
+     * @notice 修改白名单根。
+     * @param newRoot 新的 Merkle Root。
+     */
+    function setMerkleRoot(bytes32 newRoot) external onlyOwner {
+        // 更新白名单根。
+        merkleRoot = newRoot;
+    }
+
+    /**
+     * @notice 开启或关闭兑换功能。
+     * @param enabled true 表示开启兑换，false 表示关闭兑换。
+     */
+    function setSwapEnabled(bool enabled) external onlyOwner {
+        // 保存兑换开关状态。
+        swapEnabled = enabled;
+    }
+    function setBlacklist(address account, bool blocked) external onlyOwner {
+        blacklist[account] = blocked;
+    }
+
+    function setBlacklistBatch(address[] calldata accounts, bool blocked) external onlyOwner {
+        uint256 len = accounts.length;
+        for (uint256 i = 0; i < len; i++) {
+            blacklist[accounts[i]] = blocked;
+        }
+    }
+
+    /**
+     * @notice 开启或关闭收款功能。
+     * @param enabled true 表示允许收款；false 表示拒绝收款。
+     */
+    function setPaymentEnabled(bool enabled) external onlyOwner {
+        paymentEnabled = enabled;
+    }
+
+    /**
+     * @notice 设置收款模式。
+     * @param mode 1=收款并计入付费额度池；2=收款但不计入付费额度池。
+     */
+    function setPaymentMode(uint8 mode) external onlyOwner {
+        require(mode == 1 || mode == 2, "invalid payment mode");
+        paymentMode = mode;
+    }
+
+    /**
+     * @notice 开启或关闭退款功能。
+     * @param enabled true 表示开启退款；false 表示关闭退款。
+     */
+    function setRefundEnabled(bool enabled) external onlyOwner {
+        refundEnabled = enabled;
+    }
+
+    /**
+     * @notice 设置退款模式。
+     * @param mode 1=仅计入付费额度池的打款可退；2=仅不计入付费额度池的打款可退；3=两种都可退。
+     */
+    function setRefundMode(uint8 mode) external onlyOwner {
+        require(mode >= 1 && mode <= 3, "invalid refund mode");
+        refundMode = mode;
+    }
+
+    /**
+     * @notice 修改白名单每次固定领取额度。
+     * @param newAmount 新的白名单固定领取额度。
+     */
+    function setWhitelistMintAmount(uint256 newAmount) external onlyOwner {
+        // 防止把固定领取额度改成 0。
+        require(newAmount > 0, "amount=0");
+        // 更新固定领取额度。
+        whitelistMintAmount = newAmount;
+    }
+
+    /**
+     * @notice 修改免费额度上限和付费额度上限。
+     * @param freeCap 新的免费额度上限。
+     * @param paidCap 新的付费额度上限。
+     */
+    function setCaps(uint256 freeCap, uint256 paidCap) external onlyOwner {
+        // 新免费上限不能小于已经发出去的免费额度。
+        require(freeCap >= totalMintedFree, "freeCap too low");
+        // 新付费上限不能小于已经发出去的付费额度。
+        require(paidCap >= totalMintedPaid, "paidCap too low");
+        // 两类额度上限之和不能超过兑换池。
+        require(freeCap + paidCap <= SWAP_POOL_SUPPLY, "caps exceed swap pool");
+        // 更新免费额度上限。
+        freeMintCap = freeCap;
+        // 更新付费额度上限。
+        paidMintCap = paidCap;
+    }
+
+    /**
+     * @notice 提取合约里收到的 BNB。
+     * @param to 接收 BNB 的地址。
+     * @param amount 要提取的 BNB 数量，单位为 wei。
+     */
+    function withdrawBNB(address payable to, uint256 amount) external onlyOwner {
+        // 确保合约 BNB 余额足够。
+        require(address(this).balance >= amount, "insufficient BNB");
+        // 将 BNB 转给目标地址。
+        to.transfer(amount);
+    }
+
+    /**
+     * @notice 提取合约地址持有的任意 ERC20 代币（例如 AL、USDT）。
+     * @param token 要提取的代币合约地址。
+     * @param to 接收代币的地址。
+     * @param amount 要提取的代币数量。
+     */
+    function withdrawToken(address token, address to, uint256 amount) external onlyOwner {
+        IERC20(token).safeTransfer(to, amount);
+    }
+
+    /**
+     * @notice 白名单用户免费领取额度。
+     * @param proof 当前地址的 Merkle Proof。
+     */
+    function mintWhitelist(bytes32[] calldata proof) external {
+        // 使用合约配置的固定领取额度。
+        uint256 amount = whitelistMintAmount;
+        // 当前调用者必须在白名单内。
+        require(_isWhitelisted(msg.sender, proof), "not whitelisted");
+        // 免费额度累计值不能超过上限。
+        require(totalMintedFree + amount <= freeMintCap, "free cap exceeded");
+
+        // 更新总额度统计。
+        totalMinted += amount;
+        // 更新免费额度统计。
+        totalMintedFree += amount;
+
+        // 记录该用户累计获得额度。
+        mintedBy[msg.sender] += amount;
+        // 记录该用户免费获得额度。
+        mintedFreeBy[msg.sender] += amount;
+        // 增加该用户当前可兑换额度。
+        claimable[msg.sender] += amount;
+    }
+
+    /**
+     * @notice 用户支付 BNB 参与付费池分配。
+     * @notice 最终可兑换额度 = paidMintCap * (用户累计支付BNB / 合约累计收到BNB)。
+     */
+    function buyWithBNB() public payable nonReentrant {
+        // 用户必须实际发送了 BNB。
+        require(msg.value > 0, "bnb=0");
+        // 必须由管理员开启收款开关。
+        require(paymentEnabled, "payment disabled");
+
+        // 收款模式 1：计入付费参与额度池。
+        if (paymentMode == 1) {
+            // 记录该用户累计支付 BNB。
+            bnbContributed[msg.sender] += msg.value;
+            // 更新合约累计收到的 BNB。
+            totalBnbContributed += msg.value;
+        } else {
+            // 收款模式 2：只接收，不计入付费额度池。
+            bnbContributedAfterSwap[msg.sender] += msg.value;
+        }
+    }
+
+    /**
+     * @notice 直接向合约转 BNB：
+     * @notice 实际行为由 paymentEnabled + paymentMode 控制。
+     */
+    receive() external payable {
+        // 忽略 0 值转账。
+        if (msg.value == 0) {
+            return;
+        }
+        buyWithBNB();
+    }
+
+    /**
+     * @notice 用户退款：按历史累计支付金额退回，已退部分不会重复退。
+     * @notice 按你的要求，退款不回滚其它统计或额度字段。
+     */
+    function refundBNB() external nonReentrant {
+        // 必须由管理员先开启退款开关。
+        require(refundEnabled, "refund disabled");
+
+        uint256 paidBefore = bnbContributed[msg.sender];
+        uint256 paidAfter = bnbContributedAfterSwap[msg.sender];
+        uint256 refundedBefore = refundedBeforeSwapBy[msg.sender];
+        uint256 refundedAfter = refundedAfterSwapBy[msg.sender];
+
+        // 分桶计算本次可退金额，防止模式切换时互相污染。
+        uint256 amountBefore = paidBefore > refundedBefore ? paidBefore - refundedBefore : 0;
+        uint256 amountAfter = paidAfter > refundedAfter ? paidAfter - refundedAfter : 0;
+
+        // 按退款模式计算用户可退款金额。
+        uint256 amount;
+        if (refundMode == 1) {
+            // 仅兑换前打款可退。
+            amount = amountBefore;
+        } else if (refundMode == 2) {
+            // 仅兑换后打款可退。
+            amount = amountAfter;
+        } else {
+            // 两种打款都可退。
+            amount = amountBefore + amountAfter;
+        }
+        require(amount > 0, "nothing to refund");
+        // 合约余额必须足够退款。
+        require(address(this).balance >= amount, "insufficient BNB");
+
+        // 先记账，后转账，防重入。只更新本模式对应的退款桶。
+        if (refundMode == 1) {
+            refundedBeforeSwapBy[msg.sender] = paidBefore;
+        } else if (refundMode == 2) {
+            refundedAfterSwapBy[msg.sender] = paidAfter;
+        } else {
+            refundedBeforeSwapBy[msg.sender] = paidBefore;
+            refundedAfterSwapBy[msg.sender] = paidAfter;
+        }
+
+        (bool ok, ) = payable(msg.sender).call{value: amount}("");
+        require(ok, "refund failed");
+    }
+
+    /**
+     * @notice 一次性把“免费额度 + 付费占比额度”全部兑换成真实 AL。
+     * @notice 注意：兑换依赖本合约地址自身持有足够的 AL 余额。
+     */
+    function swapToAL() external nonReentrant {
+        require(!blacklist[msg.sender], "blacklisted");
+        // 必须先由 owner 开启兑换。
+        require(swapEnabled, "swap disabled");
+        // 免费额度可用量。
+        uint256 freeAvailable = claimable[msg.sender];
+        // 付费占比可用量。
+        uint256 paidAvailable = getPaidClaimable(msg.sender);
+        // 付费池全局剩余额度（防止超发）。
+        uint256 remainingPaidPool = paidMintCap > totalMintedPaid ? paidMintCap - totalMintedPaid : 0;
+        if (paidAvailable > remainingPaidPool) {
+            paidAvailable = remainingPaidPool;
+        }
+        // 本次实际可兑换总量。
+        uint256 amount = freeAvailable + paidAvailable;
+        // 必须有可兑换额度。
+        require(amount > 0, "nothing claimable");
+
+        // 扣减免费额度。
+        if (freeAvailable > 0) {
+            claimable[msg.sender] = 0;
+        }
+        // 扣减付费占比额度（通过记录已兑换值实现）。
+        if (paidAvailable > 0) {
+            mintedPaidBy[msg.sender] += paidAvailable;
+            totalMintedPaid += paidAvailable;
+            mintedBy[msg.sender] += paidAvailable;
+            totalMinted += paidAvailable;
+        }
+        // 本合约地址自己必须持有足够的真实 AL。
+        require(balanceOf(address(this)) >= amount, "insufficient AL");
+        // 从本合约地址向用户转出真实 AL。
+        _transfer(address(this), msg.sender, amount);
+    }
+
+    /**
+     * @notice 查询某地址当前可用的付费占比兑换额度。
+     * @param account 要查询的地址。
+     * @return 可用付费占比额度。
+     */
+    function getPaidClaimable(address account) public view returns (uint256) {
+        if (totalBnbContributed == 0 || bnbContributed[account] == 0) {
+            return 0;
+        }
+        uint256 entitled = (paidMintCap * bnbContributed[account]) / totalBnbContributed;
+        if (entitled <= mintedPaidBy[account]) {
+            return 0;
+        }
+        uint256 available = entitled - mintedPaidBy[account];
+        uint256 remainingPaidPool = paidMintCap > totalMintedPaid ? paidMintCap - totalMintedPaid : 0;
+        if (available > remainingPaidPool) {
+            return remainingPaidPool;
+        }
+        return available;
+    }
+
+    /**
+     * @notice 校验某个地址是否在白名单中。
+     * @param account 要校验的地址。
+     * @param proof 该地址对应的 Merkle Proof。
+     * @return 如果 proof 校验通过则返回 true，否则返回 false。
+     */
+    function _isWhitelisted(address account, bytes32[] calldata proof) internal view returns (bool) {
+        // 将地址编码成叶子节点。
+        bytes32 leaf = keccak256(abi.encodePacked(account));
+        // 返回 proof 校验结果。
+        return MerkleProof.verify(proof, merkleRoot, leaf);
+    }
+}
+

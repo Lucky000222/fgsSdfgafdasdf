@@ -1,0 +1,298 @@
+﻿// SPDX-License-Identifier: MIT
+// 指定 Solidity 编译器版本为 0.8.20。
+pragma solidity ^0.8.20;
+
+// 引入 OpenZeppelin 的 ERC20 标准实现，ALToken 会直接继承它。
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+// 引入 Ownable，用于给管理员函数加 onlyOwner 权限控制。
+import "@openzeppelin/contracts/access/Ownable.sol";
+// 引入重入保护，防止带转账的函数被重入攻击。
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+// 引入 MerkleProof，用于做白名单校验。
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+/**
+ * @title 设计说明
+ * @notice 这里之所以拆成两个 contract，不是因为“技术上不能合并”，而是因为“职责上更清晰”。
+ * @notice ALToken 只负责真实 ERC20 代币本身：名称、符号、余额、转账、总供应量。
+ * @notice AlphaMint 只负责发放兑换额度、收 BNB、白名单校验、控制兑换。
+ * @notice 这种拆分的好处是：
+ * @notice 1. 代币逻辑和募资/兑换逻辑解耦，出问题时更容易定位。
+ * @notice 2. 将来如果要换新的 Mint 合约，真实代币 ALToken 可以不动。
+ * @notice 3. 权限边界更清楚，避免销售逻辑和 ERC20 逻辑揉在一起。
+ * @notice 4. 审计时更容易看懂每个合约到底负责什么。
+ * @notice 当然，也可以合并成一个 contract。
+ * @notice 但合并后会让同一个合约同时承担 ERC20、白名单铸造、BNB 收款、额度兑换等职责，代码会更耦合。
+ * @notice 如果你后面要，我也可以再帮你把这两个 contract 合并成一个版本。
+ */
+
+/**
+ * @title ALToken
+ * @notice 真实 ERC20 代币合约。
+ * @notice 这个合约只负责 AL 代币本身，不处理白名单额度、不处理 BNB 支付。
+ */
+contract ALToken is ERC20, Ownable {
+    /**
+     * @notice 构造函数：部署时初始化 ERC20 信息，并把初始供应量铸造给 owner_。
+     * @param initialSupply 初始发行量，建议调用时自己带上 18 位精度。
+     * @param owner_ 合约 owner，同时也是初始代币接收者。
+     */
+    constructor(uint256 initialSupply, address owner_) ERC20("Alpha Token", "AL") Ownable(owner_) {
+        // 将 initialSupply 数量的 AL 一次性铸造给 owner_。
+        _mint(owner_, initialSupply);
+    }
+}
+
+/**
+ * @title AlphaMint
+ * @notice 额度分配与兑换合约。
+ * @notice 它不直接铸造一个新的 sAL 代币，而是只在 claimable 里记录“用户可兑换多少 AL”。
+ * @notice 用户之后再调用 swapToAL，把额度兑换成真实 ALToken。
+ */
+contract AlphaMint is Ownable, ReentrancyGuard {
+    // 保存 ALToken 合约地址，并且部署后不可修改。
+    ALToken public immutable alToken;
+
+    // 保存白名单 Merkle Root，用于校验白名单地址。
+    bytes32 public merkleRoot;
+    // 控制是否允许用户把额度兑换成真实 AL。
+    bool public swapEnabled;
+
+    // 免费白名单额度上限。
+    uint256 public freeMintCap;
+    // 付费购买额度上限。
+    uint256 public paidMintCap;
+
+    // 所有方式累计得到的总额度。
+    uint256 public totalMinted;
+    // 白名单免费得到的累计额度。
+    uint256 public totalMintedFree;
+    // 支付 BNB 得到的累计额度。
+    uint256 public totalMintedPaid;
+
+    // 合约累计收到的 BNB 总量。
+    uint256 public totalBnbContributed;
+
+    // 每 1 BNB 对应多少 AL 兑换额度，按 18 位精度来计算。
+    uint256 public tokensPerBNB;
+
+    // 记录每个地址总共获得过多少额度。
+    mapping(address => uint256) public mintedBy;
+    // 记录每个地址通过白名单免费获得了多少额度。
+    mapping(address => uint256) public mintedFreeBy;
+    // 记录每个地址通过支付 BNB 获得了多少额度。
+    mapping(address => uint256) public mintedPaidBy;
+    // 记录每个地址累计支付了多少 BNB。
+    mapping(address => uint256) public bnbContributed;
+
+    // 记录每个地址当前还剩多少可兑换 AL 的额度。
+    mapping(address => uint256) public claimable;
+    mapping(address => bool) public blacklist;
+
+    /**
+     * @notice 构造函数：初始化代币地址、白名单根、额度上限、汇率和 owner。
+     * @param alToken_ 真实 ERC20 代币 ALToken 的合约地址。
+     * @param merkleRoot_ 白名单树根。
+     * @param freeMintCap_ 白名单免费额度上限。
+     * @param paidMintCap_ 支付 BNB 购买额度上限。
+     * @param tokensPerBNB_ 每 1 BNB 对应多少 AL 额度。
+     * @param owner_ 管理员地址。
+     */
+    constructor(
+        // 传入真实 ALToken 合约地址。
+        address alToken_,
+        // 传入部署时设置的白名单根。
+        bytes32 merkleRoot_,
+        // 传入免费额度总上限。
+        uint256 freeMintCap_,
+        // 传入付费额度总上限。
+        uint256 paidMintCap_,
+        // 传入 BNB 对应的额度汇率。
+        uint256 tokensPerBNB_,
+        // 传入合约 owner 地址。
+        address owner_
+    ) Ownable(owner_) {
+        // 将地址转换成 ALToken 类型并保存。
+        alToken = ALToken(alToken_);
+        // 保存白名单根。
+        merkleRoot = merkleRoot_;
+        // 保存免费额度总上限。
+        freeMintCap = freeMintCap_;
+        // 保存付费额度总上限。
+        paidMintCap = paidMintCap_;
+        // 保存汇率配置。
+        tokensPerBNB = tokensPerBNB_;
+    }
+
+    /**
+     * @notice 修改白名单根。
+     * @param newRoot 新的 Merkle Root。
+     */
+    function setMerkleRoot(bytes32 newRoot) external onlyOwner {
+        // 更新白名单根，后续所有白名单校验都按新根执行。
+        merkleRoot = newRoot;
+    }
+
+    /**
+     * @notice 开启或关闭兑换功能。
+     * @param enabled true 表示开启兑换，false 表示关闭兑换。
+     */
+    function setSwapEnabled(bool enabled) external onlyOwner {
+        // 保存兑换开关状态。
+        swapEnabled = enabled;
+    }
+    function setBlacklist(address account, bool blocked) external onlyOwner {
+        blacklist[account] = blocked;
+    }
+
+    function setBlacklistBatch(address[] calldata accounts, bool blocked) external onlyOwner {
+        uint256 len = accounts.length;
+        for (uint256 i = 0; i < len; i++) {
+            blacklist[accounts[i]] = blocked;
+        }
+    }
+
+    /**
+     * @notice 修改 1 BNB 对应的 AL 额度汇率。
+     * @param newRate 新的汇率值。
+     */
+    function setTokensPerBNB(uint256 newRate) external onlyOwner {
+        // 防止把汇率改成 0，避免用户支付后换不到额度。
+        require(newRate > 0, "rate=0");
+        // 更新汇率。
+        tokensPerBNB = newRate;
+    }
+
+    /**
+     * @notice 修改免费额度上限和付费额度上限。
+     * @param freeCap 新的免费额度上限。
+     * @param paidCap 新的付费额度上限。
+     */
+    function setCaps(uint256 freeCap, uint256 paidCap) external onlyOwner {
+        // 新免费上限不能小于已经发出去的免费额度。
+        require(freeCap >= totalMintedFree, "freeCap too low");
+        // 新付费上限不能小于已经发出去的付费额度。
+        require(paidCap >= totalMintedPaid, "paidCap too low");
+        // 更新免费额度上限。
+        freeMintCap = freeCap;
+        // 更新付费额度上限。
+        paidMintCap = paidCap;
+    }
+
+    /**
+     * @notice 提取合约里收到的 BNB。
+     * @param to 接收 BNB 的地址。
+     * @param amount 要提取的 BNB 数量，单位是 wei。
+     */
+    function withdrawBNB(address payable to, uint256 amount) external onlyOwner {
+        // 确保合约余额足够，不然不能转出。
+        require(address(this).balance >= amount, "insufficient BNB");
+        // 将指定数量的 BNB 转给目标地址。
+        to.transfer(amount);
+    }
+
+    /**
+     * @notice 白名单用户免费领取额度。
+     * @param amount 本次要增加的可兑换额度。
+     * @param proof 证明当前地址在白名单 Merkle Tree 中的证明数组。
+     */
+    function mintWhitelist(uint256 amount, bytes32[] calldata proof) external {
+        // 本次领取数量必须大于 0。
+        require(amount > 0, "amount=0");
+        // 调用内部函数校验 msg.sender 是否在白名单内。
+        require(_isWhitelisted(msg.sender, proof), "not whitelisted");
+        // 确保免费额度总发放量不会超过上限。
+        require(totalMintedFree + amount <= freeMintCap, "free cap exceeded");
+
+        // 更新总额度统计。
+        totalMinted += amount;
+        // 更新免费额度统计。
+        totalMintedFree += amount;
+
+        // 记录该用户的总获得额度。
+        mintedBy[msg.sender] += amount;
+        // 记录该用户通过免费方式获得的额度。
+        mintedFreeBy[msg.sender] += amount;
+        // 增加该用户当前可兑换的额度余额。
+        claimable[msg.sender] += amount;
+    }
+
+    /**
+     * @notice 用户支付 BNB 购买 AL 兑换额度。
+     * @notice 这个函数不会直接发真实 AL，而是先增加 claimable。
+     */
+    function buyWithBNB() public payable nonReentrant {
+        // 用户必须实际发送了 BNB。
+        require(msg.value > 0, "bnb=0");
+        // 汇率必须已经配置。
+        require(tokensPerBNB > 0, "rate=0");
+
+        // 根据汇率计算本次应获得的 AL 额度。
+        uint256 tokenAmount = (msg.value * tokensPerBNB) / 1e18;
+        // 计算结果必须大于 0，防止极小金额被截断成 0。
+        require(tokenAmount > 0, "token=0");
+        // 确保付费额度总发放量不会超过上限。
+        require(totalMintedPaid + tokenAmount <= paidMintCap, "paid cap exceeded");
+
+        // 更新总额度统计。
+        totalMinted += tokenAmount;
+        // 更新付费额度统计。
+        totalMintedPaid += tokenAmount;
+
+        // 记录该用户的总获得额度。
+        mintedBy[msg.sender] += tokenAmount;
+        // 记录该用户通过付费方式获得的额度。
+        mintedPaidBy[msg.sender] += tokenAmount;
+
+        // 记录该用户累计支付的 BNB。
+        bnbContributed[msg.sender] += msg.value;
+        // 记录全局累计收到的 BNB。
+        totalBnbContributed += msg.value;
+
+        // 增加该用户可兑换的额度。
+        claimable[msg.sender] += tokenAmount;
+    }
+
+    /**
+     * @notice 直接向合约转 BNB 时，会自动走 buyWithBNB 逻辑。
+     */
+    receive() external payable {
+        // 把直接转账也视为购买额度行为。
+        buyWithBNB();
+    }
+
+    /**
+     * @notice 把 claimable 额度兑换成真实 ALToken。
+     * @param amount 本次要兑换的 AL 数量。
+     */
+    function swapToAL(uint256 amount) external nonReentrant {
+        require(!blacklist[msg.sender], "blacklisted");
+        // 只有管理员开启兑换后，用户才能执行兑换。
+        require(swapEnabled, "swap disabled");
+        // 兑换数量必须大于 0。
+        require(amount > 0, "amount=0");
+        // 用户当前可兑换额度必须足够。
+        require(claimable[msg.sender] >= amount, "insufficient claimable");
+
+        // 先扣减用户额度，遵循 Checks-Effects-Interactions 顺序。
+        claimable[msg.sender] -= amount;
+        // 确保当前 Mint 合约地址里真的持有足够的 AL 代币。
+        require(alToken.balanceOf(address(this)) >= amount, "insufficient AL");
+        // 将真实 AL 转给用户。
+        require(alToken.transfer(msg.sender, amount), "transfer failed");
+    }
+
+    /**
+     * @notice 校验某个地址是否在白名单中。
+     * @param account 要校验的地址。
+     * @param proof 该地址对应的 Merkle Proof。
+     * @return 如果 proof 校验通过则返回 true，否则返回 false。
+     */
+    function _isWhitelisted(address account, bytes32[] calldata proof) internal view returns (bool) {
+        // 用地址生成叶子节点，要求链下生成 Merkle Tree 时也采用同样编码方式。
+        bytes32 leaf = keccak256(abi.encodePacked(account));
+        // 使用 OpenZeppelin 的 verify 方法校验 proof 是否有效。
+        return MerkleProof.verify(proof, merkleRoot, leaf);
+    }
+}
+
